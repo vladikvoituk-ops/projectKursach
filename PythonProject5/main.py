@@ -4,12 +4,9 @@ import sqlite3
 from datetime import datetime, timedelta
 import hashlib
 import os
+import random
 
 DB_FILE = 'library.db'
-
-# УБИРАЕМ УДАЛЕНИЕ БАЗЫ ДАННЫХ ПРИ КАЖДОМ ЗАПУСКЕ
-# if os.path.exists(DB_FILE):
-#     os.remove(DB_FILE)
 
 COLORS = {
     'bg_dark': '#1a1a1a',
@@ -23,6 +20,9 @@ COLORS = {
     'text_secondary': '#cccccc',
     'card_bg': '#2d2d2d'
 }
+
+current_page = None
+page_history = []
 
 
 def init_db():
@@ -132,10 +132,8 @@ def init_db():
         )
     ''')
 
-    # ПРОВЕРЯЕМ, НУЖНО ЛИ ЗАПОЛНЯТЬ ДАННЫЕ
     cursor.execute("SELECT COUNT(*) FROM roles")
     if cursor.fetchone()[0] == 0:
-        print("Инициализация базы данных...")
         roles = [
             ('admin', 'Администратор системы'),
             ('librarian', 'Библиотекарь'),
@@ -171,7 +169,8 @@ def init_db():
             ('waiting_return', 'Ожидает возврата'),
             ('returned', 'Возвращена'),
             ('overdue', 'Просрочена'),
-            ('auto_returned', 'Авто-возврат')
+            ('cancelled', 'Отменена'),
+            ('revoked', 'Доступ отозван')
         ]
         cursor.executemany("INSERT INTO rent_statuses (status_name, description) VALUES (?, ?)", statuses)
 
@@ -434,7 +433,7 @@ def delete_book(book_id):
         conn.close()
 
 
-def reserve_books(user_id, book_ids):
+def reserve_books(user_id, book_ids, payment_data=None):
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -442,13 +441,16 @@ def reserve_books(user_id, book_ids):
         cursor.execute("SELECT id FROM rent_statuses WHERE status_name='reserved'")
         reserved_status_id = cursor.fetchone()[0]
 
-        cursor.execute("SELECT id FROM rent_statuses WHERE status_name='active'")
-        active_status_id = cursor.fetchone()[0]
-
         cursor.execute("SELECT id FROM payment_statuses WHERE status_name='completed'")
         completed_status_id = cursor.fetchone()[0]
 
+        cursor.execute("SELECT id FROM payment_statuses WHERE status_name='pending'")
+        pending_status_id = cursor.fetchone()[0]
+
         total_cost = 0
+        digital_books = []
+        physical_books = []
+
         for book_id in book_ids:
             cursor.execute('''
                 SELECT bt.type_name, b.price, b.available_quantity 
@@ -465,25 +467,29 @@ def reserve_books(user_id, book_ids):
                 cost = price * 14
                 total_cost += cost
 
+                if book_type == 'digital':
+                    digital_books.append(book_id)
+                else:
+                    physical_books.append(book_id)
+
                 cursor.execute('''INSERT INTO rents (user_id, book_id, rent_date, expected_return_date, status_id, cost) 
                                VALUES (?, ?, ?, ?, ?, ?)''',
                                (user_id, book_id, rent_date, return_date, reserved_status_id, cost))
 
-                if book_type == 'digital':
-                    cursor.execute("UPDATE rents SET status_id=? WHERE id=?", (active_status_id, cursor.lastrowid))
-
                 cursor.execute("UPDATE books SET available_quantity = available_quantity - 1 WHERE id=?", (book_id,))
+
+        payment_status = completed_status_id if digital_books else pending_status_id
 
         if total_cost > 0:
             cursor.execute("INSERT INTO payments (user_id, amount, status_id) VALUES (?, ?, ?)",
-                           (user_id, total_cost, completed_status_id))
+                           (user_id, total_cost, payment_status))
 
         conn.commit()
-        return True
+        return True, digital_books, physical_books
     except Exception as e:
         conn.rollback()
         print(f"Error: {e}")
-        return False
+        return False, [], []
     finally:
         conn.close()
 
@@ -561,6 +567,84 @@ def confirm_return(rent_id, librarian_id):
         return True
     except Exception as e:
         conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+def revoke_access(rent_id, librarian_id):
+    """Полный отзыв доступа - удаление записи аренды"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Получаем информацию о бронировании перед удалением
+        cursor.execute('''
+            SELECT r.book_id, r.cost, p.id 
+            FROM rents r 
+            LEFT JOIN payments p ON r.id = p.rent_id 
+            WHERE r.id=?
+        ''', (rent_id,))
+        rent_info = cursor.fetchone()
+
+        if not rent_info:
+            return False
+
+        book_id, cost, payment_id = rent_info
+
+        # Удаляем связанные платежи
+        if payment_id:
+            cursor.execute("DELETE FROM payments WHERE id=?", (payment_id,))
+
+        # Удаляем саму аренду
+        cursor.execute("DELETE FROM rents WHERE id=?", (rent_id,))
+
+        # Возвращаем книгу в доступные
+        cursor.execute("UPDATE books SET available_quantity = available_quantity + 1 WHERE id=?", (book_id,))
+
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"Error revoking access: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def cancel_reservation(rent_id):
+    """Полная отмена бронирования - удаление записи"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Получаем информацию о бронировании перед удалением
+        cursor.execute('''
+            SELECT r.book_id, r.cost, p.id 
+            FROM rents r 
+            LEFT JOIN payments p ON r.id = p.rent_id 
+            WHERE r.id=?
+        ''', (rent_id,))
+        rent_info = cursor.fetchone()
+
+        if not rent_info:
+            return False
+
+        book_id, cost, payment_id = rent_info
+
+        # Удаляем связанные платежи
+        if payment_id:
+            cursor.execute("DELETE FROM payments WHERE id=?", (payment_id,))
+
+        # Удаляем саму аренду
+        cursor.execute("DELETE FROM rents WHERE id=?", (rent_id,))
+
+        # Возвращаем книгу в доступные
+        cursor.execute("UPDATE books SET available_quantity = available_quantity + 1 WHERE id=?", (book_id,))
+
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"Error cancelling reservation: {e}")
         return False
     finally:
         conn.close()
@@ -663,8 +747,8 @@ def auto_return_expired_digital_books():
     cursor = conn.cursor()
 
     try:
-        cursor.execute("SELECT id FROM rent_statuses WHERE status_name='auto_returned'")
-        auto_returned_status_id = cursor.fetchone()[0]
+        cursor.execute("SELECT id FROM rent_statuses WHERE status_name='returned'")
+        returned_status_id = cursor.fetchone()[0]
 
         cursor.execute("SELECT id FROM rent_statuses WHERE status_name='active'")
         active_status_id = cursor.fetchone()[0]
@@ -684,7 +768,7 @@ def auto_return_expired_digital_books():
         for rent_id, book_id in expired_rents:
             return_date = datetime.now().date().isoformat()
             cursor.execute("UPDATE rents SET status_id=?, actual_return_date=? WHERE id=?",
-                           (auto_returned_status_id, return_date, rent_id))
+                           (returned_status_id, return_date, rent_id))
             cursor.execute("UPDATE books SET available_quantity = available_quantity + 1 WHERE id=?", (book_id,))
 
         conn.commit()
@@ -732,7 +816,7 @@ def get_remaining_days(rent_date, expected_return_date):
     today = datetime.now().date()
     expected = datetime.strptime(expected_return_date, '%Y-%m-%d').date()
     remaining = (expected - today).days
-    return max(0, remaining)
+    return remaining
 
 
 class ModernButton(tk.Canvas):
@@ -814,6 +898,65 @@ class BookCard(tk.Frame):
             reserve_btn.pack(pady=10)
 
 
+def show_page(page_frame, title=""):
+    global current_page
+    if current_page:
+        current_page.pack_forget()
+        page_history.append(current_page)
+
+    current_page = page_frame
+    current_page.pack(fill='both', expand=True)
+
+
+def go_back():
+    global current_page
+    if page_history:
+        current_page.pack_forget()
+        current_page = page_history.pop()
+        current_page.pack(fill='both', expand=True)
+
+
+def create_navigation_header(parent, title):
+    header = tk.Frame(parent, bg=COLORS['bg_medium'], height=60)
+    header.pack(fill='x', pady=5)
+    header.pack_propagate(False)
+
+    back_btn = ModernButton(header, "⬅️ Назад", command=go_back, width=100, height=35)
+    back_btn.pack(side='left', padx=20, pady=15)
+
+    tk.Label(header, text=title, font=('Arial', 14, 'bold'),
+             bg=COLORS['bg_medium'], fg=COLORS['text_primary']).pack(side='left', padx=20, pady=20)
+
+    return header
+
+
+def create_password_entry(parent):
+    """Создает поле ввода пароля с кнопкой показа/скрытия"""
+    password_frame = tk.Frame(parent, bg=COLORS['bg_dark'])
+
+    password_entry = ttk.Entry(password_frame, show="*", width=25, font=('Arial', 11))
+    password_entry.pack(side='left', padx=(0, 5))
+
+    # Создаем кнопку показа/скрытия пароля
+    show_btn = tk.Button(password_frame, text="👁️", font=('Arial', 10),
+                         bg=COLORS['bg_light'], fg=COLORS['text_primary'],
+                         relief='flat', width=3)
+    show_btn.pack(side='left')
+
+    def toggle_password():
+        if password_entry.cget('show') == '*':
+            password_entry.config(show='')
+            show_btn.config(text="🙈")
+        else:
+            password_entry.config(show='*')
+            show_btn.config(text="👁️")
+
+    # Привязываем функцию к кнопке
+    show_btn.config(command=toggle_password)
+
+    return password_frame, password_entry
+
+
 root = tk.Tk()
 root.title("📚 Гибридная Библиотека")
 root.geometry("1200x700")
@@ -841,6 +984,128 @@ def show_frame(frame):
     frame.pack(fill='both', expand=True)
 
 
+def create_payment_page(digital_books, physical_books, total_cost):
+    payment_frame = tk.Frame(reader_frame, bg=COLORS['bg_dark'])
+
+    create_navigation_header(payment_frame, "💳 Оплата бронирования")
+
+    content_frame = tk.Frame(payment_frame, bg=COLORS['bg_dark'])
+    content_frame.pack(fill='both', expand=True, padx=20, pady=20)
+
+    if digital_books:
+        tk.Label(content_frame, text="💳 Оплата цифровых книг", font=('Arial', 16, 'bold'),
+                 bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=20)
+
+        tk.Label(content_frame, text=f"Сумма к оплате: {total_cost} руб", font=('Arial', 12),
+                 bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=10)
+
+        payment_form = tk.Frame(content_frame, bg=COLORS['bg_medium'], relief='raised', bd=1)
+        payment_form.pack(pady=20, padx=50, fill='x')
+
+        fields = [
+            ("Номер карты:", "card_number"),
+            ("Срок действия:", "expiry_date"),
+            ("CVV:", "cvv"),
+            ("Имя владельца:", "card_holder")
+        ]
+
+        entries = {}
+        for i, (label, field) in enumerate(fields):
+            row = tk.Frame(payment_form, bg=COLORS['bg_medium'])
+            row.pack(fill='x', pady=8, padx=20)
+
+            tk.Label(row, text=label, bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
+                     font=('Arial', 10)).pack(side='left', padx=5)
+
+            if field == 'card_number':
+                entry = ttk.Entry(row, width=25, font=('Arial', 10))
+                entry.pack(side='left', padx=5, fill='x', expand=True)
+            elif field == 'expiry_date':
+                entry = ttk.Entry(row, width=10, font=('Arial', 10))
+                entry.pack(side='left', padx=5)
+            elif field == 'cvv':
+                entry = ttk.Entry(row, width=8, font=('Arial', 10), show='*')
+                entry.pack(side='left', padx=5)
+            else:
+                entry = ttk.Entry(row, width=25, font=('Arial', 10))
+                entry.pack(side='left', padx=5, fill='x', expand=True)
+
+            entries[field] = entry
+
+        def process_payment():
+            card_number = entries['card_number'].get()
+            expiry_date = entries['expiry_date'].get()
+            cvv = entries['cvv'].get()
+            card_holder = entries['card_holder'].get()
+
+            if not all([card_number, expiry_date, cvv, card_holder]):
+                messagebox.showerror("Ошибка", "Заполните все поля карты")
+                return
+
+            if len(card_number.replace(" ", "")) != 16 or not card_number.replace(" ", "").isdigit():
+                messagebox.showerror("Ошибка", "Неверный номер карты")
+                return
+
+            success = random.choice([True, True, True, False])
+
+            if success:
+                book_ids = digital_books + physical_books
+                result, _, _ = reserve_books(current_user['id'], book_ids)
+                if result:
+                    messagebox.showinfo("Успех", "✅ Оплата прошла успешно! Книги забронированы.")
+                    show_reader_interface()
+                else:
+                    messagebox.showerror("Ошибка", "❌ Ошибка бронирования")
+            else:
+                messagebox.showerror("Ошибка", "❌ Ошибка оплаты. Проверьте данные карты.")
+
+        btn_frame = tk.Frame(content_frame, bg=COLORS['bg_dark'])
+        btn_frame.pack(pady=20)
+
+        ModernButton(btn_frame, "💳 Оплатить", command=process_payment, width=150, height=40).pack(side='left', padx=10)
+        ModernButton(btn_frame, "❌ Отмена", command=show_reader_interface, width=150, height=40,
+                     color=COLORS['accent_red']).pack(side='left', padx=10)
+
+    if physical_books:
+        tk.Label(content_frame, text="📚 Физические книги", font=('Arial', 16, 'bold'),
+                 bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=20)
+
+        info_text = """
+Для получения физических книг необходимо:
+1. Прийти в библиотеку в рабочее время
+2. Предъявить читательский билет
+3. Оплатить на месте стоимость аренды
+4. Получить книги у библиотекаря
+
+📞 Контакты библиотеки:
+📍 Адрес: ул. Книжная, д. 1
+🕒 Время работы: 9:00-18:00 (Пн-Пт)
+📞 Телефон: +7 (999) 123-45-67
+        """
+
+        info_label = tk.Label(content_frame, text=info_text, font=('Arial', 11), justify='left',
+                              bg=COLORS['bg_dark'], fg=COLORS['text_primary'])
+        info_label.pack(pady=20)
+
+        def confirm_physical_reservation():
+            book_ids = digital_books + physical_books
+            result, _, _ = reserve_books(current_user['id'], book_ids)
+            if result:
+                messagebox.showinfo("Успех", "✅ Бронирование подтверждено! Ждем вас в библиотеке.")
+                show_reader_interface()
+            else:
+                messagebox.showerror("Ошибка", "❌ Ошибка бронирования")
+
+        if not digital_books:
+            btn_frame = tk.Frame(content_frame, bg=COLORS['bg_dark'])
+            btn_frame.pack(pady=20)
+
+            ModernButton(btn_frame, "✅ Подтвердить бронирование",
+                         command=confirm_physical_reservation, width=200, height=40).pack()
+
+    return payment_frame
+
+
 def create_login_screen():
     show_frame(login_frame)
     for widget in login_frame.winfo_children():
@@ -860,38 +1125,33 @@ def create_login_screen():
     button_container.pack(pady=30)
 
     def open_login(role):
-        login_win = tk.Toplevel(root)
-        login_win.title(f"Вход - {role}")
-        login_win.geometry("400x300")  # Увеличил размер окна
-        login_win.configure(bg=COLORS['bg_dark'])
-        login_win.resizable(False, False)
-        login_win.grab_set()
+        login_page = tk.Frame(login_frame, bg=COLORS['bg_dark'])
 
-        # Центрирование окна
-        login_win.transient(root)
-        login_win.geometry("+%d+%d" % (root.winfo_rootx() + 100, root.winfo_rooty() + 100))
+        header = create_navigation_header(login_page, f"Вход как {role}")
 
-        tk.Label(login_win, text=f"Вход как {role}", font=('Arial', 14, 'bold'),
-                 bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=25)
+        content = tk.Frame(login_page, bg=COLORS['bg_dark'])
+        content.pack(fill='both', expand=True, pady=50)
 
-        form_frame = tk.Frame(login_win, bg=COLORS['bg_dark'])
-        form_frame.pack(pady=20, padx=40, fill='x')
+        tk.Label(content, text=f"Вход как {role}", font=('Arial', 16, 'bold'),
+                 bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=20)
+
+        form_frame = tk.Frame(content, bg=COLORS['bg_dark'])
+        form_frame.pack(pady=30)
 
         tk.Label(form_frame, text="Логин:", bg=COLORS['bg_dark'], fg=COLORS['text_primary'],
-                 font=('Arial', 10)).grid(row=0, column=0, sticky='w', pady=12)
-        username_entry = ttk.Entry(form_frame, width=25, font=('Arial', 10))
-        username_entry.grid(row=0, column=1, pady=12, padx=15, sticky='ew')
+                 font=('Arial', 11)).grid(row=0, column=0, sticky='w', pady=15)
+        username_entry = ttk.Entry(form_frame, width=25, font=('Arial', 11))
+        username_entry.grid(row=0, column=1, pady=15, padx=15)
 
         tk.Label(form_frame, text="Пароль:", bg=COLORS['bg_dark'], fg=COLORS['text_primary'],
-                 font=('Arial', 10)).grid(row=1, column=0, sticky='w', pady=12)
-        password_entry = ttk.Entry(form_frame, show="*", width=25, font=('Arial', 10))
-        password_entry.grid(row=1, column=1, pady=12, padx=15, sticky='ew')
+                 font=('Arial', 11)).grid(row=1, column=0, sticky='w', pady=15)
 
-        form_frame.columnconfigure(1, weight=1)
+        # Используем новую функцию для создания поля пароля с кнопкой показа
+        password_frame, password_entry = create_password_entry(form_frame)
+        password_frame.grid(row=1, column=1, pady=15, padx=15, sticky='w')
 
         def do_login():
             if login_user(username_entry.get(), password_entry.get(), role):
-                login_win.destroy()
                 if current_user['role'] == 'reader':
                     show_reader_interface()
                 elif current_user['role'] == 'librarian':
@@ -901,16 +1161,14 @@ def create_login_screen():
             else:
                 messagebox.showerror("Ошибка", "Неверные данные")
 
-        btn_frame = tk.Frame(login_win, bg=COLORS['bg_dark'])
-        btn_frame.pack(pady=25)
+        btn_frame = tk.Frame(content, bg=COLORS['bg_dark'])
+        btn_frame.pack(pady=30)
 
         ModernButton(btn_frame, "Войти", command=do_login, width=120, height=40).pack(side='left', padx=10)
-        ModernButton(btn_frame, "Отмена", command=login_win.destroy, width=120, height=40,
-                     color=COLORS['bg_light']).pack(side='left', padx=10)
 
+        show_page(login_page)
         username_entry.focus()
 
-        # Обработка нажатия Enter
         def on_enter(event):
             do_login()
 
@@ -918,30 +1176,36 @@ def create_login_screen():
         password_entry.bind('<Return>', on_enter)
 
     def open_register():
-        reg_win = tk.Toplevel(root)
-        reg_win.title("Регистрация читателя")
-        reg_win.geometry("400x350")
-        reg_win.configure(bg=COLORS['bg_dark'])
-        reg_win.resizable(False, False)
+        register_page = tk.Frame(login_frame, bg=COLORS['bg_dark'])
 
-        tk.Label(reg_win, text="Регистрация читателя", font=('Arial', 14, 'bold'),
+        header = create_navigation_header(register_page, "Регистрация читателя")
+
+        content = tk.Frame(register_page, bg=COLORS['bg_dark'])
+        content.pack(fill='both', expand=True, pady=30)
+
+        tk.Label(content, text="Регистрация читателя", font=('Arial', 16, 'bold'),
                  bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=20)
 
-        form_frame = tk.Frame(reg_win, bg=COLORS['bg_dark'])
-        form_frame.pack(pady=20, padx=40, fill='x')
+        form_frame = tk.Frame(content, bg=COLORS['bg_dark'])
+        form_frame.pack(pady=20)
 
-        fields = [("Логин:", "username"), ("Пароль:", "password"), ("Email:", "email")]
+        fields = [("Логин:", "username"), ("Email:", "email")]
         entries = {}
 
         for i, (label, field) in enumerate(fields):
             tk.Label(form_frame, text=label, bg=COLORS['bg_dark'], fg=COLORS['text_primary'],
-                     font=('Arial', 10)).grid(row=i, column=0, sticky='w', pady=12)
-            entry = ttk.Entry(form_frame, width=25, font=('Arial', 10),
-                              show="*" if field == "password" else "")
-            entry.grid(row=i, column=1, pady=12, padx=15, sticky='ew')
+                     font=('Arial', 11)).grid(row=i, column=0, sticky='w', pady=12)
+            entry = ttk.Entry(form_frame, width=25, font=('Arial', 11))
+            entry.grid(row=i, column=1, pady=12, padx=15)
             entries[field] = entry
 
-        form_frame.columnconfigure(1, weight=1)
+        # Поле пароля с кнопкой показа
+        tk.Label(form_frame, text="Пароль:", bg=COLORS['bg_dark'], fg=COLORS['text_primary'],
+                 font=('Arial', 11)).grid(row=2, column=0, sticky='w', pady=12)
+
+        password_frame, password_entry = create_password_entry(form_frame)
+        password_frame.grid(row=2, column=1, pady=12, padx=15, sticky='w')
+        entries['password'] = password_entry
 
         def do_register():
             username = entries['username'].get()
@@ -954,14 +1218,16 @@ def create_login_screen():
 
             if register_user(username, password, email, 'reader'):
                 messagebox.showinfo("Успех", "Регистрация успешна!")
-                reg_win.destroy()
+                show_page(main_container)
             else:
                 messagebox.showerror("Ошибка", "Логин занят")
 
-        btn_frame = tk.Frame(reg_win, bg=COLORS['bg_dark'])
+        btn_frame = tk.Frame(content, bg=COLORS['bg_dark'])
         btn_frame.pack(pady=20)
 
         ModernButton(btn_frame, "Зарегистрироваться", command=do_register, width=180, height=40).pack()
+
+        show_page(register_page)
 
     roles = [
         ("👤 Читатель", "reader", COLORS['accent_blue']),
@@ -980,16 +1246,21 @@ def create_login_screen():
     ModernButton(register_frame, "📝 Регистрация читателя", command=open_register,
                  width=250, height=45, color=COLORS['accent_blue']).pack()
 
+    show_page(main_container)
+
 
 def show_reader_interface():
     global cart
     cart = []
     show_frame(reader_frame)
+    page_history.clear()
 
     for widget in reader_frame.winfo_children():
         widget.destroy()
 
-    header = tk.Frame(reader_frame, bg=COLORS['bg_medium'], height=60)
+    main_page = tk.Frame(reader_frame, bg=COLORS['bg_dark'])
+
+    header = tk.Frame(main_page, bg=COLORS['bg_medium'], height=60)
     header.pack(fill='x', pady=5)
     header.pack_propagate(False)
 
@@ -999,11 +1270,12 @@ def show_reader_interface():
     btn_container = tk.Frame(header, bg=COLORS['bg_medium'])
     btn_container.pack(side='right', padx=20, pady=15)
 
-    ModernButton(btn_container, "📊 Мои бронирования", command=show_reader_rents, width=160).pack(side='left', padx=5)
+    ModernButton(btn_container, "📊 Мои бронирования", command=show_reader_rents_page, width=160).pack(side='left',
+                                                                                                      padx=5)
     ModernButton(btn_container, "🚪 Выход", command=logout, width=120, color=COLORS['bg_light']).pack(side='left',
                                                                                                      padx=5)
 
-    search_frame = tk.Frame(reader_frame, bg=COLORS['bg_dark'])
+    search_frame = tk.Frame(main_page, bg=COLORS['bg_dark'])
     search_frame.pack(fill='x', pady=15, padx=20)
 
     tk.Label(search_frame, text="🔍 Поиск:", bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(side='left', padx=5)
@@ -1020,7 +1292,7 @@ def show_reader_interface():
 
     ModernButton(search_frame, "Найти", command=do_search, width=80).pack(side='left', padx=10)
 
-    cart_frame = tk.Frame(reader_frame, bg=COLORS['bg_medium'], relief='raised', bd=1)
+    cart_frame = tk.Frame(main_page, bg=COLORS['bg_medium'], relief='raised', bd=1)
     cart_frame.pack(fill='x', pady=5, padx=20)
 
     cart_label = tk.Label(cart_frame, text="🛒 Корзина: 0 книг", font=('Arial', 11, 'bold'),
@@ -1033,18 +1305,44 @@ def show_reader_interface():
             return
 
         book_ids = [book[0] for book in cart]
-        if reserve_books(current_user['id'], book_ids):
-            cart.clear()
-            cart_label.config(text="🛒 Корзина: 0 книг")
-            refresh_books()
-            messagebox.showinfo("Успех", f"✅ Забронировано {len(book_ids)} книг!")
+
+        digital_books = []
+        physical_books = []
+        total_cost = 0
+
+        for book_id in book_ids:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT bt.type_name, b.price
+                FROM books b
+                JOIN book_types bt ON b.book_type_id = bt.id
+                WHERE b.id=?
+            ''', (book_id,))
+            book_data = cursor.fetchone()
+            conn.close()
+
+            if book_data:
+                book_type, price = book_data
+                cost = price * 14
+                total_cost += cost
+
+                if book_type == 'digital':
+                    digital_books.append(book_id)
+                else:
+                    physical_books.append(book_id)
+
+        if digital_books:
+            payment_page = create_payment_page(digital_books, physical_books, total_cost)
+            show_page(payment_page)
         else:
-            messagebox.showerror("Ошибка", "Ошибка бронирования")
+            payment_page = create_payment_page([], physical_books, total_cost)
+            show_page(payment_page)
 
     ModernButton(cart_frame, "📦 Забронировать все", command=reserve_from_cart, width=160).pack(side='right', padx=15,
                                                                                                pady=5)
 
-    cards_container = tk.Frame(reader_frame, bg=COLORS['bg_dark'])
+    cards_container = tk.Frame(main_page, bg=COLORS['bg_dark'])
     cards_container.pack(fill='both', expand=True, padx=20, pady=10)
 
     canvas = tk.Canvas(cards_container, bg=COLORS['bg_dark'], highlightthickness=0)
@@ -1093,22 +1391,24 @@ def show_reader_interface():
     scrollbar.pack(side='right', fill='y')
     refresh_books()
 
+    show_page(main_page)
 
-def show_reader_rents():
-    rents_win = tk.Toplevel(root)
-    rents_win.title("Мои бронирования")
-    rents_win.geometry("900x550")
-    rents_win.configure(bg=COLORS['bg_dark'])
 
-    tk.Label(rents_win, text="📊 Мои бронирования", font=('Arial', 16, 'bold'),
-             bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=20)
+def show_reader_rents_page():
+    rents_page = tk.Frame(reader_frame, bg=COLORS['bg_dark'])
 
-    table_frame = tk.Frame(rents_win, bg=COLORS['bg_dark'])
-    table_frame.pack(fill='both', expand=True, padx=20, pady=10)
+    header = create_navigation_header(rents_page, "📊 Мои бронирования")
+
+    content = tk.Frame(rents_page, bg=COLORS['bg_dark'])
+    content.pack(fill='both', expand=True, padx=20, pady=20)
+
+    table_frame = tk.Frame(content, bg=COLORS['bg_dark'])
+    table_frame.pack(fill='both', expand=True)
 
     rents_tree = ttk.Treeview(table_frame,
                               columns=(
-                              'id', 'title', 'type', 'rent_date', 'return_date', 'remaining_days', 'status', 'cost'),
+                                  'id', 'title', 'type', 'rent_date', 'return_date', 'remaining_days', 'status',
+                                  'cost'),
                               show='headings', height=15)
 
     columns = [
@@ -1145,11 +1445,12 @@ def show_reader_rents():
                 'waiting_return': '📦 Ожидает возврата',
                 'returned': '📚 Возвращена',
                 'overdue': '⚠️ Просрочена',
-                'auto_returned': '🤖 Авто-возврат'
+                'cancelled': '❌ Отменена',
+                'revoked': '🚫 Доступ отозван'
             }.get(status, status)
 
             remaining_days = ""
-            if status in ['active', 'reserved'] and book_type == 'digital':
+            if status in ['active', 'reserved']:
                 remaining_days = get_remaining_days(rent_date, exp_return)
                 remaining_days = f"{remaining_days} дн."
 
@@ -1157,23 +1458,44 @@ def show_reader_rents():
                 rent_id, title, book_type, rent_date, exp_return, remaining_days, status_text, f"{cost} руб"
             ))
 
+    def cancel_selected_reservation():
+        selected = rents_tree.selection()
+        if not selected:
+            messagebox.showwarning("Предупреждение", "Выберите бронирование для отмены")
+            return
+
+        rent_id = rents_tree.item(selected[0])['values'][0]
+        book_title = rents_tree.item(selected[0])['values'][1]
+
+        if messagebox.askyesno("Подтверждение", f"Отменить бронирование книги '{book_title}'?"):
+            if cancel_reservation(rent_id):
+                messagebox.showinfo("Успех", "✅ Бронирование отменено!")
+                refresh_rents()
+            else:
+                messagebox.showerror("Ошибка", "❌ Ошибка отмены бронирования")
+
     refresh_rents()
 
-    button_frame = tk.Frame(rents_win, bg=COLORS['bg_dark'])
-    button_frame.pack(pady=20)
+    btn_frame = tk.Frame(content, bg=COLORS['bg_dark'])
+    btn_frame.pack(pady=20)
 
-    ModernButton(button_frame, "🔄 Обновить", command=refresh_rents, width=140).pack(side='left', padx=10)
-    ModernButton(button_frame, "✖️ Закрыть", command=rents_win.destroy, width=140, color=COLORS['bg_light']).pack(
-        side='left', padx=10)
+    ModernButton(btn_frame, "🔄 Обновить", command=refresh_rents, width=140).pack(side='left', padx=10)
+    ModernButton(btn_frame, "❌ Отменить бронь", command=cancel_selected_reservation, width=160,
+                 color=COLORS['accent_red']).pack(side='left', padx=10)
+
+    show_page(rents_page)
 
 
 def show_librarian_interface():
     show_frame(librarian_frame)
+    page_history.clear()
 
     for widget in librarian_frame.winfo_children():
         widget.destroy()
 
-    header = tk.Frame(librarian_frame, bg=COLORS['bg_medium'], height=60)
+    main_page = tk.Frame(librarian_frame, bg=COLORS['bg_dark'])
+
+    header = tk.Frame(main_page, bg=COLORS['bg_medium'], height=60)
     header.pack(fill='x', pady=5)
     header.pack_propagate(False)
 
@@ -1183,7 +1505,7 @@ def show_librarian_interface():
     ModernButton(header, "🚪 Выход", command=logout, width=120, height=35,
                  color=COLORS['bg_light']).pack(side='right', padx=20, pady=15)
 
-    notebook = ttk.Notebook(librarian_frame)
+    notebook = ttk.Notebook(main_page)
     notebook.pack(fill='both', expand=True, pady=10)
 
     actions_tab = tk.Frame(notebook, bg=COLORS['bg_dark'])
@@ -1203,17 +1525,16 @@ def show_librarian_interface():
     tk.Label(pickup_frame, text=f"📦 Ожидают выдачи: {pending_pickups}", font=('Arial', 12, 'bold'),
              bg=COLORS['card_bg'], fg=COLORS['text_primary']).pack(pady=15)
 
-    def show_pending_pickups():
-        pickups_win = tk.Toplevel(root)
-        pickups_win.title("Ожидают выдачи")
-        pickups_win.geometry("800x450")
-        pickups_win.configure(bg=COLORS['bg_dark'])
+    def show_pending_pickups_page():
+        pickups_page = tk.Frame(librarian_frame, bg=COLORS['bg_dark'])
 
-        tk.Label(pickups_win, text="📦 Книги ожидающие выдачи", font=('Arial', 14, 'bold'),
-                 bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=20)
+        header = create_navigation_header(pickups_page, "📦 Книги ожидающие выдачи")
 
-        table_frame = tk.Frame(pickups_win, bg=COLORS['bg_dark'])
-        table_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        content = tk.Frame(pickups_page, bg=COLORS['bg_dark'])
+        content.pack(fill='both', expand=True, padx=20, pady=20)
+
+        table_frame = tk.Frame(content, bg=COLORS['bg_dark'])
+        table_frame.pack(fill='both', expand=True)
 
         tree = ttk.Treeview(table_frame, columns=('id', 'user', 'title', 'rent_date'), show='headings', height=12)
 
@@ -1258,14 +1579,16 @@ def show_librarian_interface():
         tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
 
-        btn_frame = tk.Frame(pickups_win, bg=COLORS['bg_dark'])
+        btn_frame = tk.Frame(content, bg=COLORS['bg_dark'])
         btn_frame.pack(pady=20)
 
         ModernButton(btn_frame, "✅ Подтвердить выдачу", command=confirm_selected_pickup, width=160).pack(side='left',
                                                                                                          padx=10)
         ModernButton(btn_frame, "🔄 Обновить", command=refresh_pickups, width=140).pack(side='left', padx=10)
 
-    ModernButton(pickup_frame, "📋 Просмотреть список", command=show_pending_pickups, width=180).pack(pady=10)
+        show_page(pickups_page)
+
+    ModernButton(pickup_frame, "📋 Просмотреть список", command=show_pending_pickups_page, width=180).pack(pady=10)
 
     return_frame = tk.Frame(actions_frame, bg=COLORS['card_bg'], relief='raised', bd=2)
     return_frame.pack(fill='x', pady=10, padx=20)
@@ -1273,20 +1596,20 @@ def show_librarian_interface():
     tk.Label(return_frame, text=f"📚 Ожидают возврата: {pending_returns}", font=('Arial', 12, 'bold'),
              bg=COLORS['card_bg'], fg=COLORS['text_primary']).pack(pady=15)
 
-    def show_pending_returns():
-        returns_win = tk.Toplevel(root)
-        returns_win.title("Ожидают возврата")
-        returns_win.geometry("900x500")
-        returns_win.configure(bg=COLORS['bg_dark'])
+    def show_pending_returns_page():
+        returns_page = tk.Frame(librarian_frame, bg=COLORS['bg_dark'])
 
-        tk.Label(returns_win, text="📚 Книги ожидающие возврата", font=('Arial', 14, 'bold'),
-                 bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=20)
+        header = create_navigation_header(returns_page, "📚 Все активные аренды")
 
-        table_frame = tk.Frame(returns_win, bg=COLORS['bg_dark'])
-        table_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        content = tk.Frame(returns_page, bg=COLORS['bg_dark'])
+        content.pack(fill='both', expand=True, padx=20, pady=20)
+
+        table_frame = tk.Frame(content, bg=COLORS['bg_dark'])
+        table_frame.pack(fill='both', expand=True)
 
         tree = ttk.Treeview(table_frame,
-                            columns=('id', 'user', 'title', 'type', 'rent_date', 'expected_return', 'remaining_days'),
+                            columns=('id', 'user', 'title', 'type', 'rent_date', 'expected_return', 'remaining_days',
+                                     'status'),
                             show='headings', height=12)
 
         columns = [
@@ -1296,7 +1619,8 @@ def show_librarian_interface():
             ('type', 'Тип', 80),
             ('rent_date', 'Дата аренды', 100),
             ('expected_return', 'Вернуть до', 100),
-            ('remaining_days', 'Осталось дней', 100)
+            ('remaining_days', 'Осталось дней', 100),
+            ('status', 'Статус', 120)
         ]
 
         for col, heading, width in columns:
@@ -1309,7 +1633,7 @@ def show_librarian_interface():
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT r.id, u.username, b.title, bt.type_name, r.rent_date, r.expected_return_date
+                SELECT r.id, u.username, b.title, bt.type_name, r.rent_date, r.expected_return_date, rs.status_name
                 FROM rents r 
                 JOIN users u ON r.user_id = u.id 
                 JOIN books b ON r.book_id = b.id 
@@ -1318,14 +1642,17 @@ def show_librarian_interface():
                 WHERE rs.status_name IN ('active', 'reserved')
             ''')
             for row in cursor.fetchall():
-                rent_id, username, title, book_type, rent_date, exp_return = row
-                remaining_days = ""
-                if book_type == 'digital':
-                    remaining_days = get_remaining_days(rent_date, exp_return)
-                    remaining_days = f"{remaining_days} дн."
+                rent_id, username, title, book_type, rent_date, exp_return, status = row
+                remaining_days = get_remaining_days(rent_date, exp_return)
+                remaining_days = f"{remaining_days} дн."
+
+                status_text = {
+                    'reserved': '🔄 Забронирована',
+                    'active': '✅ Активна'
+                }.get(status, status)
 
                 tree.insert('', 'end', values=(
-                    rent_id, username, title, book_type, rent_date, exp_return, remaining_days
+                    rent_id, username, title, book_type, rent_date, exp_return, remaining_days, status_text
                 ))
             conn.close()
 
@@ -1345,6 +1672,22 @@ def show_librarian_interface():
                 else:
                     messagebox.showinfo("Информация", "📖 Цифровые книги возвращаются автоматически по истечении срока")
 
+        def revoke_selected_access():
+            selected = tree.selection()
+            if selected:
+                rent_id = tree.item(selected[0])['values'][0]
+                username = tree.item(selected[0])['values'][1]
+                title = tree.item(selected[0])['values'][2]
+
+                if messagebox.askyesno("Подтверждение",
+                                       f"Отозвать доступ у пользователя '{username}' к книге '{title}'?"):
+                    if revoke_access(rent_id, current_user['id']):
+                        messagebox.showinfo("Успех", "✅ Доступ отозван!")
+                        refresh_returns()
+                        show_librarian_interface()
+                    else:
+                        messagebox.showerror("Ошибка", "❌ Ошибка отзыва доступа")
+
         refresh_returns()
 
         tree.pack(side='left', fill='both', expand=True)
@@ -1352,14 +1695,18 @@ def show_librarian_interface():
         tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
 
-        btn_frame = tk.Frame(returns_win, bg=COLORS['bg_dark'])
+        btn_frame = tk.Frame(content, bg=COLORS['bg_dark'])
         btn_frame.pack(pady=20)
 
         ModernButton(btn_frame, "✅ Подтвердить возврат", command=confirm_selected_return, width=160).pack(side='left',
                                                                                                           padx=10)
+        ModernButton(btn_frame, "🚫 Отозвать доступ", command=revoke_selected_access, width=160,
+                     color=COLORS['accent_red']).pack(side='left', padx=10)
         ModernButton(btn_frame, "🔄 Обновить", command=refresh_returns, width=140).pack(side='left', padx=10)
 
-    ModernButton(return_frame, "📋 Просмотреть список", command=show_pending_returns, width=180).pack(pady=10)
+        show_page(returns_page)
+
+    ModernButton(return_frame, "📋 Просмотреть список", command=show_pending_returns_page, width=180).pack(pady=10)
 
     def refresh_all_rents():
         for item in rents_tree.get_children():
@@ -1374,11 +1721,12 @@ def show_librarian_interface():
                 'waiting_return': '📦 Ожидает возврата',
                 'returned': '📚 Возвращена',
                 'overdue': '⚠️ Просрочена',
-                'auto_returned': '🤖 Авто-возврат'
+                'cancelled': '❌ Отменена',
+                'revoked': '🚫 Доступ отозван'
             }.get(status, status)
 
             remaining_days = ""
-            if status in ['active', 'reserved'] and book_type == 'digital':
+            if status in ['active', 'reserved']:
                 remaining_days = get_remaining_days(rent_date, exp_return)
                 remaining_days = f"{remaining_days} дн."
 
@@ -1391,10 +1739,8 @@ def show_librarian_interface():
     rents_container.pack(fill='both', expand=True, padx=20, pady=10)
 
     rents_tree = ttk.Treeview(rents_container,
-                              columns=(
-                                  'id', 'user', 'title', 'type', 'rent_date', 'exp_return', 'act_return',
-                                  'remaining_days', 'status',
-                                  'cost'),
+                              columns=('id', 'user', 'title', 'type', 'rent_date', 'exp_return', 'act_return',
+                                       'remaining_days', 'status', 'cost'),
                               show='headings', height=15)
 
     rent_columns = [
@@ -1427,14 +1773,20 @@ def show_librarian_interface():
 
     refresh_all_rents()
 
+    show_page(main_page)
+
 
 def show_admin_interface():
     show_frame(admin_frame)
+    page_history.clear()
 
     for widget in admin_frame.winfo_children():
         widget.destroy()
 
-    header = tk.Frame(admin_frame, bg=COLORS['bg_medium'], height=60)
+    main_page = tk.Frame(admin_frame, bg=COLORS['bg_dark'])
+    main_page.pack(fill='both', expand=True)
+
+    header = tk.Frame(main_page, bg=COLORS['bg_medium'], height=60)
     header.pack(fill='x', pady=5)
     header.pack_propagate(False)
 
@@ -1444,8 +1796,26 @@ def show_admin_interface():
     ModernButton(header, "🚪 Выход", command=logout, width=120, height=35,
                  color=COLORS['bg_light']).pack(side='right', padx=20, pady=15)
 
-    notebook = ttk.Notebook(admin_frame)
-    notebook.pack(fill='both', expand=True, pady=10)
+    # Создаем основной контейнер с прокруткой для админ панели
+    main_container = tk.Frame(main_page, bg=COLORS['bg_dark'])
+    main_container.pack(fill='both', expand=True)
+
+    # Создаем canvas и scrollbar для основного контейнера
+    canvas = tk.Canvas(main_container, bg=COLORS['bg_dark'], highlightthickness=0)
+    scrollbar = ttk.Scrollbar(main_container, orient='vertical', command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas, bg=COLORS['bg_dark'])
+
+    scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    def on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+    notebook = ttk.Notebook(scrollable_frame)
+    notebook.pack(fill='both', expand=True, pady=10, padx=10)
 
     books_tab = tk.Frame(notebook, bg=COLORS['bg_dark'])
     notebook.add(books_tab, text='📚 Книги')
@@ -1456,7 +1826,6 @@ def show_admin_interface():
     users_tab = tk.Frame(notebook, bg=COLORS['bg_dark'])
     notebook.add(users_tab, text='👥 Пользователи')
 
-    # Вкладка книг
     search_frame = tk.Frame(books_tab, bg=COLORS['bg_dark'])
     search_frame.pack(fill='x', pady=15, padx=20)
 
@@ -1499,10 +1868,6 @@ def show_admin_interface():
     books_tree.pack(side='left', fill='both', expand=True)
     scrollbar.pack(side='right', fill='y')
 
-    # Кнопки управления книгами
-    book_buttons_frame = tk.Frame(books_tab, bg=COLORS['bg_dark'])
-    book_buttons_frame.pack(pady=15)
-
     def edit_selected_book():
         selected = books_tree.selection()
         if not selected:
@@ -1510,7 +1875,7 @@ def show_admin_interface():
             return
 
         book_id = books_tree.item(selected[0])['values'][0]
-        show_edit_book_dialog(book_id)
+        show_edit_book_page(book_id)
 
     def delete_selected_book():
         selected = books_tree.selection()
@@ -1527,6 +1892,9 @@ def show_admin_interface():
                 refresh_admin_books()
             else:
                 messagebox.showerror("Ошибка", "Не удалось удалить книгу")
+
+    book_buttons_frame = tk.Frame(books_tab, bg=COLORS['bg_dark'])
+    book_buttons_frame.pack(pady=15)
 
     ModernButton(book_buttons_frame, "✏️ Редактировать", command=edit_selected_book, width=160).pack(side='left',
                                                                                                      padx=10)
@@ -1583,7 +1951,7 @@ def show_admin_interface():
         price = entries['price'].get()
         quantity = entries['quantity'].get()
         description = entries['description'].get("1.0", "end-1c") if hasattr(entries['description'], 'get') else \
-        entries['description'].get()
+            entries['description'].get()
 
         if not title or not author or not price or not quantity:
             messagebox.showerror("Ошибка", "Заполните обязательные поля")
@@ -1595,7 +1963,6 @@ def show_admin_interface():
             if add_book(title, author, book_type, isbn, genre, price, quantity, description):
                 refresh_admin_books()
                 messagebox.showinfo("Успех", "Книга добавлена!")
-                # Очистка полей
                 for field, entry in entries.items():
                     if field == 'type':
                         entry.set('physical')
@@ -1616,27 +1983,13 @@ def show_admin_interface():
 
     ModernButton(button_frame, "➕ Добавить книгу", command=add_new_book, width=160).pack()
 
-    def show_edit_book_dialog(book_id):
-        edit_win = tk.Toplevel(root)
-        edit_win.title("Редактировать книгу")
-        edit_win.geometry("600x600")  # Увеличил высоту
-        edit_win.configure(bg=COLORS['bg_dark'])
-        edit_win.resizable(False, False)
+    def show_edit_book_page(book_id):
+        edit_page = tk.Frame(admin_frame, bg=COLORS['bg_dark'])
 
-        # Центрирование окна
-        edit_win.transient(root)
-        edit_win.geometry("+%d+%d" % (root.winfo_rootx() + 200, root.winfo_rooty() + 50))
+        header = create_navigation_header(edit_page, "✏️ Редактировать книгу")
 
-        # Основной контейнер с прокруткой
-        main_container = tk.Frame(edit_win, bg=COLORS['bg_dark'])
-        main_container.pack(fill='both', expand=True, padx=20, pady=10)
-
-        tk.Label(main_container, text="✏️ Редактировать книгу", font=('Arial', 16, 'bold'),
-                 bg=COLORS['bg_dark'], fg=COLORS['text_primary']).pack(pady=20)
-
-        # Контейнер для формы с фиксированной высотой
-        form_container = tk.Frame(main_container, bg=COLORS['bg_dark'])
-        form_container.pack(fill='both', expand=True)
+        content = tk.Frame(edit_page, bg=COLORS['bg_dark'])
+        content.pack(fill='both', expand=True, padx=20, pady=20)
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1653,10 +2006,9 @@ def show_admin_interface():
 
         if not book:
             messagebox.showerror("Ошибка", "Книга не найдена")
-            edit_win.destroy()
             return
 
-        form_frame = tk.Frame(form_container, bg=COLORS['bg_dark'])
+        form_frame = tk.Frame(content, bg=COLORS['bg_dark'])
         form_frame.pack(fill='both', expand=True, pady=10)
 
         edit_entries = {}
@@ -1687,7 +2039,6 @@ def show_admin_interface():
                 entry.delete(0, 'end')
                 entry.insert(0, str(value))
             elif field == 'description':
-                # Для описания создаем отдельный фрейм с меткой и текстовым полем
                 desc_frame = tk.Frame(form_frame, bg=COLORS['bg_dark'])
                 desc_frame.pack(fill='x', pady=8)
 
@@ -1707,8 +2058,7 @@ def show_admin_interface():
 
             edit_entries[field] = entry
 
-        # Фрейм для кнопок внизу окна
-        button_frame = tk.Frame(main_container, bg=COLORS['bg_dark'])
+        button_frame = tk.Frame(content, bg=COLORS['bg_dark'])
         button_frame.pack(pady=20)
 
         def save_changes():
@@ -1733,17 +2083,16 @@ def show_admin_interface():
                 if update_book(book_id, title, author, book_type, isbn, genre, price, quantity, description):
                     refresh_admin_books()
                     messagebox.showinfo("Успех", "Книга обновлена!")
-                    edit_win.destroy()
+                    show_page(main_page)
                 else:
                     messagebox.showerror("Ошибка", "Ошибка обновления")
             except ValueError:
                 messagebox.showerror("Ошибка", "Цена и количество должны быть числами")
 
-        # Кнопки с достаточным отступом
         ModernButton(button_frame, "💾 Сохранить изменения", command=save_changes,
                      width=180, height=40).pack(side='left', padx=10)
-        ModernButton(button_frame, "✖️ Отмена", command=edit_win.destroy,
-                     width=120, height=40, color=COLORS['bg_light']).pack(side='left', padx=10)
+
+        show_page(edit_page)
 
     def refresh_admin_books(search=''):
         for item in books_tree.get_children():
@@ -1754,7 +2103,6 @@ def show_admin_interface():
 
     refresh_admin_books()
 
-    # Вкладка статистики
     stats_label = tk.Label(stats_tab, text="", font=('Arial', 11), justify='left',
                            bg=COLORS['bg_dark'], fg=COLORS['text_primary'])
     stats_label.pack(pady=20, padx=20)
@@ -1787,7 +2135,6 @@ def show_admin_interface():
     ModernButton(stats_button_frame, "🔄 Обновить статистику", command=refresh_stats, width=180).pack()
     refresh_stats()
 
-    # Вкладка пользователей
     users_container = tk.Frame(users_tab, bg=COLORS['bg_dark'])
     users_container.pack(fill='both', expand=True, padx=20, pady=10)
 
@@ -1843,11 +2190,19 @@ def show_admin_interface():
 
     refresh_users()
 
+    # Упаковываем canvas и scrollbar в основной контейнер
+    canvas.pack(side='left', fill='both', expand=True)
+    scrollbar.pack(side='right', fill='y')
+
+    show_page(main_page)
+
 
 def logout():
-    global current_user, cart
+    global current_user, cart, current_page, page_history
     current_user = None
     cart = []
+    current_page = None
+    page_history = []
     create_login_screen()
 
 
